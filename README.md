@@ -1,7 +1,8 @@
-#  MTDT: Multi-scale Temporal Decomposition Transformer
+#  
+Multi-scale Temporal Decomposition Transformer: A Robust Framework for Multi-Regional Power Load Forecasting
 
 This repository contains the official PyTorch implementation for the paper: 
-**"Multi-scale Temporal Decomposition Transformer (MTDT): A Robust Framework for Multi-Regional Load Forecasting"**.
+**"Multi-scale Temporal Decomposition Transformer: A Robust Framework for Multi-Regional Power Load Forecasting"**.
 
 ## Project Structure
 
