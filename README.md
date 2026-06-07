@@ -37,7 +37,7 @@ pip install -r requirements.txt~
 
 ### 2.Training & Evaluation 
 
-To execute the full pipeline (training and evaluation) in the background, use the `nohup` command. This ensures the process continues running even if the terminal session disconnects. **Run the following command:** 
+To execute the full pipeline in the background, use the `nohup` command. This ensures the process continues running even if the terminal session disconnects. **Run the following command:** 
 
 ~~~
 nohup python -u ./model/run_all.py > ./model/run.log 2>&1 &
