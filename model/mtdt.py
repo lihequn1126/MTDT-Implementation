@@ -13,6 +13,8 @@ import math
 import shutil
 import random
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 # ================= 0. 设置随机种子 =================
 def set_seed(seed=42):
     random.seed(seed)
@@ -57,7 +59,8 @@ class Config:
     FREQ = '15min'
 
     # 模型参数
-    ENC_IN = 0          # 自动计算
+    ENC_IN = 0          # 自动计算 (= C, 全部特征列数含目标)
+    N_KNOWN = 0         # 自动计算 (未来已知协变量列数 = NWP + 日历)
     D_MODEL = 512       
     N_HEADS = 8         
     E_LAYERS = 2        
@@ -216,6 +219,7 @@ class OptimizedDecompModel(nn.Module):
         self.seq_len = configs.SEQ_LEN
         self.pred_len = configs.PRED_LEN
         self.use_norm = configs.USE_NORM
+        self.n_known = configs.N_KNOWN   # 未来已知协变量列数 (NWP + 日历)
         
         # 1. Decomposition
         # kernel_size 设为 35  平滑短期波动
@@ -243,9 +247,9 @@ class OptimizedDecompModel(nn.Module):
         # 简单的线性映射：[Batch, Vars, Seq_Len] -> [Batch, Vars, Pred_Len]
         self.trend_projector = nn.Linear(self.seq_len, self.pred_len)
 
-    def forward(self, x_hist, x_fut_nwp):
-        # x_hist: [Batch, Seq_Len, Vars]
-        # x_fut_nwp: [Batch, Pred_Len, Vars_NWP]
+    def forward(self, x_hist, x_fut_known):
+        # x_hist:      [Batch, Seq_Len, C]            (历史全部特征, 目标在最后一列)
+        # x_fut_known: [Batch, Pred_Len, n_known]     (未来已知协变量: NWP + 日历)
         
         # --- Step 1: Normalization (RevIN) ---
         if self.use_norm:
@@ -253,34 +257,28 @@ class OptimizedDecompModel(nn.Module):
             stdev = torch.sqrt(torch.var(x_hist, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
             x_hist = (x_hist - means) / stdev
             
-            # 对未来 NWP 也做同样的 norm (使用历史 NWP 的统计量)
-            # 假设 NWP 是前 N-1 列
-            means_nwp = means[:, :, :-1]
-            stdev_nwp = stdev[:, :, :-1]
-            x_fut_nwp = (x_fut_nwp - means_nwp) / stdev_nwp
+            # 仅对未来"已知"协变量归一化 (用其历史统计量, 前 n_known 列)
+            means_k = means[:, :, :self.n_known]
+            stdev_k = stdev[:, :, :self.n_known]
+            x_fut_known = (x_fut_known - means_k) / stdev_k
 
         # --- Step 2: Decomposition ---
-        # 将历史数据分解为 Seasonal 和 Trend
         seasonal_init, trend_init = self.decomposition(x_hist)
         
         # --- Step 3: Trend Branch (Linear) ---
-        # permute to [Batch, Vars, Seq_Len] for Linear
         trend_init = trend_init.permute(0, 2, 1)
         trend_output = self.trend_projector(trend_init) # -> [Batch, Vars, Pred_Len]
         trend_output = trend_output.permute(0, 2, 1)    # -> [Batch, Pred_Len, Vars]
         
         # --- Step 4: Seasonal Branch (iTransformer) ---
-        # 构造 iTransformer 的输入：
-        # Seasonal_Hist + Zero_Padding_Target (or Future_NWP)
-        batch_size = x_hist.shape[0]
+        # 构造未来块: 已知列填真实未来值, 未知列(lag/rolling + 目标)在归一化空间置零
+        # 这样彻底杜绝 load_mean_1d 等衍生特征把未来真值泄漏进模型
+        batch_size, C = x_hist.shape[0], x_hist.shape[2]
+        n_unknown = C - self.n_known
+        zeros_unknown = torch.zeros(batch_size, self.pred_len, n_unknown, device=x_hist.device)
+        x_fut_combined = torch.cat([x_fut_known, zeros_unknown], dim=2)  # [B, Pred, C]
         
-        # 拼接未来特征：NWP部分用真实的 x_fut_nwp，Target部分填0
-        zeros_target = torch.zeros(batch_size, self.pred_len, 1, device=x_hist.device)
-        x_fut_combined = torch.cat([x_fut_nwp, zeros_target], dim=2)
-        
-        # 拼接历史 seasonal 和未来
         # 注意：这里我们让 iTransformer 看到的是 "去趋势后的历史" + "未来特征"
-        # 这样 Attention 只需要关注波动
         x_full = torch.cat([seasonal_init, x_fut_combined], dim=1)
         
         # Embedding & Encoder [Batch, Vars, Time] -> [Batch, Vars, D_Model]
@@ -305,140 +303,25 @@ class OptimizedDecompModel(nn.Module):
 
 # ================= 2. 数据处理 (Data Loading) =================
 
-def load_and_process_data():
-    print("🚀 Loading data with Enhanced Features...")
-    if not os.path.exists(cfg.NWP_PATH) or not os.path.exists(cfg.LOAD_PATH):
-        print("Warning: Data path not found.")
-        return None
-
-    try:
-        df_nwp = pd.read_csv(cfg.NWP_PATH)
-        df_load = pd.read_csv(cfg.LOAD_PATH)
-    except Exception as e:
-        print(f"Error reading CSV: {e}")
-        return None
-    
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    load_cols = [c for c in df.columns if 'load' in c.lower()]
-    target_col = load_cols[0] if load_cols else df.columns[-1]
-    
-    # [基础特征]
-    minutes = df.index.hour * 60 + df.index.minute
-    df['min_sin'] = np.sin(2 * np.pi * minutes / 1440)
-    df['min_cos'] = np.cos(2 * np.pi * minutes / 1440)
-    df['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
-    df['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
-    
-    # === [核心修改 3] 特征增强 (Lag Features) ===
-    print("Adding Lag Features...")
-    # 假设一天 96 个点
-    day_steps = 96
-    
-    # 1. 昨天同一时刻
-    df['load_lag_1d'] = df[target_col].shift(day_steps)
-    # 2. 上周同一时刻 (强周期性)
-    df['load_lag_7d'] = df[target_col].shift(day_steps * 7)
-    # 3. 昨天附近的均值 (平滑特征)
-    df['load_mean_1d'] = df[target_col].rolling(window=day_steps, min_periods=1).mean().shift(1)
-    
-    # 删除因 shift 产生的空值
-    df = df.dropna()
-    
-    # 确保 Target 在最后一列
-    feature_cols = [c for c in df.columns if c != target_col]
-    df = df[feature_cols + [target_col]]
-    
-    print(f"Features ({len(feature_cols)}): {feature_cols}")
-    print(f"Target: {target_col}")
-    
-    return df
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, data, seq_len, pred_len):
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        
-    def __len__(self):
-        return len(self.data) - self.seq_len - self.pred_len + 1
-        
-    def __getitem__(self, index):
-        s_begin = index
-        s_end = s_begin + self.seq_len
-        r_begin = s_end
-        r_end = r_begin + self.pred_len
-        
-        seq_x = self.data[s_begin:s_end]
-        # NWP 是除了最后一列(Target)之外的所有列吗？
-        # 注意：这里因为加了 Lag 特征，Lag 也是历史已知的，但在未来是未知的
-        # 但我们这里的 Dataset 逻辑是：x_fut_nwp 应该只包含真实的未来已知量 (NWP + Time)
-        # Lag 特征在未来是未知的（因为通过递归预测得到，或者这里简化为只用 NWP）
-        # 为了代码不崩，我们假设 x_fut_nwp 取除了 Lag 和 Load 之外的特征
-        # 简单处理：取前 N 列作为 NWP (假设 Lag 特征放在中间了)
-        # 让我们回溯 load_and_process_data，feature_cols 顺序不确定
-        # 为了稳健，我们这里简单将所有非 Target 列视为 Future Input，
-        # 实际预测时，Lag 列在未来位置的值其实是无效的，但 Transformer 会学习忽略它们或利用它们（如果是 Leakage）。
-        # **严谨做法**：x_fut_nwp 应该只包含 NWP 和 Time features。
-        # 考虑到代码通用性，这里直接取 :-1。
-        seq_x_fut_nwp = self.data[r_begin:r_end, :-1] 
-        seq_y = self.data[r_begin:r_end, -1:]
-        
-        return seq_x, seq_x_fut_nwp, seq_y
-
-def create_dataloaders(df):
-    total_rows = len(df)
-    total_days = total_rows // cfg.POINTS_PER_DAY
-    
-    if cfg.FIXED_TRAIN_DAYS is not None and cfg.FIXED_VAL_DAYS is not None:
-        n_train_days = cfg.FIXED_TRAIN_DAYS
-        n_val_days = cfg.FIXED_VAL_DAYS
-    else:
-        n_train_days = int(total_days * cfg.TRAIN_RATIO)
-        n_val_days = int(total_days * cfg.VAL_RATIO)
-    
-    train_end_idx = n_train_days * cfg.POINTS_PER_DAY
-    val_end_idx = (n_train_days + n_val_days) * cfg.POINTS_PER_DAY
-    
-    df_train = df.iloc[:train_end_idx]
-    df_val = df.iloc[train_end_idx:val_end_idx]
-    df_test = df.iloc[val_end_idx:] 
-    
-    scaler = StandardScaler()
-    train_vals = scaler.fit_transform(df_train.values)
-    val_vals = scaler.transform(df_val.values) if len(df_val) > 0 else np.empty((0, train_vals.shape[1]))
-    test_vals = scaler.transform(df_test.values) if len(df_test) > 0 else np.empty((0, train_vals.shape[1]))
-    
-    scaler_y = StandardScaler()
-    scaler_y.mean_ = scaler.mean_[-1]
-    scaler_y.scale_ = scaler.scale_[-1]
-    scaler_y.var_ = scaler.var_[-1]
-    
-    cfg.ENC_IN = train_vals.shape[1]
-    
-    def prepare_data(curr, prev_tail=None):
-        if prev_tail is not None: return np.vstack([prev_tail, curr])
-        return curr
-
-    train_data = prepare_data(train_vals, None)
-    # Val/Test 需要拼接前一段的尾部以构建序列
-    val_data = prepare_data(val_vals, train_vals[-cfg.SEQ_LEN:]) if len(val_vals) > 0 else np.empty((0, cfg.ENC_IN))
-    test_data = prepare_data(test_vals, val_vals[-cfg.SEQ_LEN:]) if len(test_vals) > 0 else np.empty((0, cfg.ENC_IN))
-    
-    train_set = TimeSeriesDataset(train_data, cfg.SEQ_LEN, cfg.PRED_LEN)
-    val_set = TimeSeriesDataset(val_data, cfg.SEQ_LEN, cfg.PRED_LEN)
-    test_set = TimeSeriesDataset(test_data, cfg.SEQ_LEN, cfg.PRED_LEN)
-    
-    train_loader = DataLoader(train_set, batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    
-    test_start_time = df_test.index[0] if len(df_test) > 0 else None
-    
-    return train_loader, val_loader, test_loader, scaler_y, test_start_time
+def prepare_loaders():
+    """使用统一无泄漏数据管道 (data_provider) 构建数据。
+    未来窗口只含"已知协变量"(NWP + 日历)，lag/rolling 仅存在于历史输入。"""
+    loaders, scaler_y, test_start_time, info, _roles = get_data(
+        nwp_path=cfg.NWP_PATH,
+        load_path=cfg.LOAD_PATH,
+        seq_len=cfg.SEQ_LEN,
+        pred_len=cfg.PRED_LEN,
+        batch_size=cfg.BATCH_SIZE,
+        train_ratio=cfg.TRAIN_RATIO,
+        val_ratio=cfg.VAL_RATIO,
+        points_per_day=cfg.POINTS_PER_DAY,
+        mode="future",
+    )
+    cfg.ENC_IN = info['n_features']
+    cfg.N_KNOWN = info['n_known']
+    print(f"Features (C={cfg.ENC_IN}, n_known={cfg.N_KNOWN}): {info['feature_names']}")
+    return (loaders['train'], loaders['val'], loaders['test'],
+            scaler_y, test_start_time)
 
 # ================= 3. 训练与评估 =================
 
@@ -452,9 +335,7 @@ def train_and_evaluate():
     dayplot_dir = os.path.join(cfg.OUTPUT_DIR, "dayplot")
     os.makedirs(dayplot_dir, exist_ok=True)
     
-    df = load_and_process_data()
-    if df is None: return
-    train_loader, val_loader, test_loader, scaler_y, test_start_time = create_dataloaders(df)
+    train_loader, val_loader, test_loader, scaler_y, test_start_time = prepare_loaders()
     
     # 使用优化后的分解模型
     model = OptimizedDecompModel(cfg).to(DEVICE)
