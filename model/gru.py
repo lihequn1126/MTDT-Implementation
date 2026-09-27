@@ -13,6 +13,8 @@ import shutil
 
 import argparse
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 parser = argparse.ArgumentParser(description='Time Series Forecasting')
 
 
@@ -122,60 +124,8 @@ class Seq2SeqGRU(nn.Module):
         return predictions
 
 # ==============================================================================
-# 2. 数据处理 (保持不变)
+# 2. 数据处理: 统一使用 data_provider.get_data (future 模式)
 # ==============================================================================
-
-def load_and_process_data():
-    print("Loading data...")
-    if not os.path.exists(NWP_PATH) or not os.path.exists(LOAD_PATH):
-        raise FileNotFoundError("数据文件路径不正确")
-        
-    df_nwp = pd.read_csv(NWP_PATH)
-    df_load = pd.read_csv(LOAD_PATH)
-    
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    load_col = [c for c in df.columns if 'load' in c.lower()]
-    if not load_col: raise ValueError("未找到包含 'load' 的列名")
-    df = df.rename(columns={load_col[0]: 'y'})
-    
-    # 特征工程
-    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-    df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
-    
-    df = df.dropna()
-    day_steps = 96
-    df = df.iloc[day_steps * 7:]
-    cols = [c for c in df.columns if c != 'y'] + ['y']
-    df = df[cols]
-    
-    return df
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X_enc, X_dec, y):
-        self.X_enc = torch.tensor(X_enc, dtype=torch.float32)
-        self.X_dec = torch.tensor(X_dec, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-    def __len__(self): return len(self.X_enc)
-    def __getitem__(self, idx): return self.X_enc[idx], self.X_dec[idx], self.y[idx]
-
-def create_sequences(data, seq_len, pred_len):
-    xs_enc, xs_dec, ys = [], [], []
-    for i in range(len(data) - seq_len - pred_len + 1):
-        x_enc = data[i : (i + seq_len), :] 
-        x_dec = data[(i + seq_len) : (i + seq_len + pred_len), :-1]
-        y = data[(i + seq_len) : (i + seq_len + pred_len), -1]
-        
-        xs_enc.append(x_enc)
-        xs_dec.append(x_dec)
-        ys.append(y)
-        
-    return np.array(xs_enc), np.array(xs_dec), np.array(ys)
 
 # ==============================================================================
 # 3. 训练与评估流程 (移除 Attention 相关部分)
@@ -189,61 +139,17 @@ def train_and_evaluate():
     dayplot_dir = os.path.join(OUTPUT_DIR, "dayplot")
     os.makedirs(dayplot_dir, exist_ok=True)
     
-    # 1. 数据准备
-    df = load_and_process_data()
-    total_rows = len(df)
-    total_days = total_rows // POINTS_PER_DAY
-    print(f"Total Data: {total_rows} points ({total_days:.2f} days)")
-    
-    if FIXED_TRAIN_DAYS is not None and FIXED_VAL_DAYS is not None:
-        n_train_days = FIXED_TRAIN_DAYS
-        n_val_days = FIXED_VAL_DAYS
-    else:
-        n_train_days = int(total_days * TRAIN_RATIO)
-        n_val_days = int(total_days * VAL_RATIO)
-    n_test_days = total_days - n_train_days - n_val_days
-    
-    print(f"Split: Train={n_train_days}, Val={n_val_days}, Test={n_test_days}")
-    
-    train_end_idx = n_train_days * POINTS_PER_DAY
-    val_end_idx = (n_train_days + n_val_days) * POINTS_PER_DAY
-    
-    df_train = df.iloc[:train_end_idx]
-    df_val   = df.iloc[train_end_idx:val_end_idx]
-    df_test  = df.iloc[val_end_idx:]
-    
-    scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(df_train.values)
-    val_scaled = scaler.transform(df_val.values)
-    test_scaled = scaler.transform(df_test.values)
-    
-    scaler_y = StandardScaler()
-    scaler_y.fit(df_train['y'].values.reshape(-1, 1))
-    
-    def prepare_dataset(curr_scaled, prev_scaled_tail=None):
-        if prev_scaled_tail is not None:
-            data_combined = np.vstack([prev_scaled_tail, curr_scaled])
-        else:
-            data_combined = curr_scaled
-        return create_sequences(data_combined, SEQ_LEN, PRED_LEN)
-
-    X_enc_train, X_dec_train, y_train = prepare_dataset(train_scaled, None)
-    
-    train_tail = train_scaled[-SEQ_LEN:]
-    X_enc_val, X_dec_val, y_val = prepare_dataset(val_scaled, train_tail)
-    
-    val_tail = val_scaled[-SEQ_LEN:]
-    X_enc_test, X_dec_test, y_test = prepare_dataset(test_scaled, val_tail)
-    
-    print(f"Train Shape: Enc={X_enc_train.shape}, Dec={X_dec_train.shape}")
-    
-    train_loader = DataLoader(TimeSeriesDataset(X_enc_train, X_dec_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(X_enc_val, X_dec_val, y_val), batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(TimeSeriesDataset(X_enc_test, X_dec_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
+    # 1. 统一无泄漏数据管道 (future 模式: decoder 只吃未来已知协变量 NWP+日历)
+    loaders, scaler_y, test_start_time, info, _ = get_data(
+        NWP_PATH, LOAD_PATH, SEQ_LEN, PRED_LEN, BATCH_SIZE,
+        TRAIN_RATIO, VAL_RATIO, POINTS_PER_DAY, mode="future")
+    train_loader = loaders['train']
+    val_loader = loaders['val']
+    test_loader = loaders['test']
     
     # 2. 模型初始化
-    input_dim = X_enc_train.shape[2] 
-    decoder_input_dim = X_dec_train.shape[2]
+    input_dim = info['n_features']          # encoder 输入 = 全部特征列
+    decoder_input_dim = info['n_known']     # decoder 输入 = 未来已知协变量 (NWP + 日历)
     
     encoder = GRUEncoder(input_dim, HIDDEN_DIM, NUM_LAYERS, DROPOUT)
     decoder = GRUDecoder(HIDDEN_DIM, NUM_LAYERS, decoder_input_dim, 1, DROPOUT)
@@ -263,6 +169,7 @@ def train_and_evaluate():
         batch_losses = []
         for enc_in, dec_in, target in train_loader:
             enc_in, dec_in, target = enc_in.to(DEVICE), dec_in.to(DEVICE), target.to(DEVICE)
+            target = target.squeeze(-1)  # [B,H,1] -> [B,H]
             optimizer.zero_grad()
             
             # Forward
@@ -281,6 +188,7 @@ def train_and_evaluate():
         with torch.no_grad():
             for enc_in, dec_in, target in val_loader:
                 enc_in, dec_in, target = enc_in.to(DEVICE), dec_in.to(DEVICE), target.to(DEVICE)
+                target = target.squeeze(-1)  # [B,H,1] -> [B,H]
                 pred = model(enc_in, dec_in)
                 val_batch_losses.append(criterion(pred, target).item())
         
@@ -321,14 +229,14 @@ def train_and_evaluate():
             pred = model(enc_in, dec_in)
             
             test_preds_list.append(pred.cpu().numpy())
-            test_trues_list.append(target.numpy())
+            test_trues_list.append(target.squeeze(-1).numpy())
             
     test_preds = np.concatenate(test_preds_list)
     test_trues = np.concatenate(test_trues_list)
     
-    # 反归一化
-    test_preds_inv = scaler_y.inverse_transform(test_preds)
-    test_trues_inv = scaler_y.inverse_transform(test_trues)
+    # 反归一化 (scaler_y 提供标量 mean_/scale_)
+    test_preds_inv = test_preds * scaler_y.scale_ + scaler_y.mean_
+    test_trues_inv = test_trues * scaler_y.scale_ + scaler_y.mean_
     
     mae = mean_absolute_error(test_trues_inv.flatten(), test_preds_inv.flatten())
     rmse = np.sqrt(mean_squared_error(test_trues_inv.flatten(), test_preds_inv.flatten()))
@@ -340,7 +248,7 @@ def train_and_evaluate():
         f.write(f"MAE: {mae}\nRMSE: {rmse}\nR2: {r2}\n")
     
     stitch_pred, stitch_true, stitch_time = [], [], []
-    test_start_time = df_test.index[0]
+    # test_start_time 由统一数据管道提供
     
     for i in range(0, len(test_preds_inv), POINTS_PER_DAY):
         if i >= len(test_preds_inv): break
