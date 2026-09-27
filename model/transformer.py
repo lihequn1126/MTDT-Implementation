@@ -17,6 +17,8 @@ import shutil
 
 import argparse
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 parser = argparse.ArgumentParser(description='Time Series Forecasting')
 
 
@@ -69,58 +71,8 @@ plt.rcParams['axes.unicode_minus'] = False
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==============================================================================
-# --- 1. 数据处理 (Data Processing) ---
+# --- 1. 数据处理: 统一使用 data_provider.get_data (history 模式) ---
 # ==============================================================================
-
-def load_and_process_data():
-    print("🚀 Loading data...")
-    if not os.path.exists(NWP_PATH) or not os.path.exists(LOAD_PATH):
-        raise FileNotFoundError("数据文件路径不正确")
-
-    df_nwp = pd.read_csv(NWP_PATH)
-    df_load = pd.read_csv(LOAD_PATH)
-    
-    # 时间对齐
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    # 统一列名
-    load_col = [c for c in df.columns if 'load' in c.lower()][0]
-    df = df.rename(columns={load_col: 'y'})
-    
-    # 特征工程
-    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-    df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
-    
-    # 简单的 dropna
-    df = df.dropna()
-    
-    # 调整列顺序，y放最后
-    cols = [c for c in df.columns if c != 'y'] + ['y']
-    df = df[cols]
-    day_steps = 96
-    df = df.iloc[day_steps * 7:]
-    
-    return df
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-    def __len__(self): return len(self.X)
-    def __getitem__(self, idx): return self.X[idx], self.y[idx]
-
-def create_sequences(data, seq_len, pred_len):
-    xs, ys = [], []
-    for i in range(len(data) - seq_len - pred_len + 1):
-        x = data[i:(i + seq_len), :-1]
-        y = data[(i + seq_len):(i + seq_len + pred_len), -1]
-        xs.append(x)
-        ys.append(y)
-    return np.array(xs), np.array(ys)
 
 # ==============================================================================
 # --- 2. Transformer 模型定义 ---
@@ -195,70 +147,16 @@ def train_and_evaluate():
     dayplot_dir = os.path.join(OUTPUT_DIR, "dayplot")
     os.makedirs(dayplot_dir, exist_ok=True)
     
-    # 1. 数据加载与按天切分
-    df = load_and_process_data()
-    total_rows = len(df)
-    total_days = total_rows // POINTS_PER_DAY
-    print(f"Total Data: {total_rows} points ({total_days:.2f} days)")
-    
-    # 计算切分天数
-    if FIXED_TRAIN_DAYS is not None and FIXED_VAL_DAYS is not None:
-        n_train_days = FIXED_TRAIN_DAYS
-        n_val_days = FIXED_VAL_DAYS
-    else:
-        n_train_days = int(total_days * TRAIN_RATIO)
-        n_val_days = int(total_days * VAL_RATIO)
-    
-    n_test_days = total_days - n_train_days - n_val_days
-    if n_test_days <= 0: raise ValueError("Test set empty, adjust ratio.")
-    
-    print(f"Split Plan (Days): Train={n_train_days}, Val={n_val_days}, Test={n_test_days}")
-    
-    # 计算索引
-    train_end_idx = n_train_days * POINTS_PER_DAY
-    val_end_idx = (n_train_days + n_val_days) * POINTS_PER_DAY
-    
-    # 物理切分 DataFrame
-    df_train = df.iloc[:train_end_idx]
-    df_val   = df.iloc[train_end_idx:val_end_idx]
-    df_test  = df.iloc[val_end_idx:]
-    
-    # 2. 归一化 (防泄露：只 Fit 训练集)
-    scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(df_train.values)
-    val_scaled = scaler.transform(df_val.values)
-    test_scaled = scaler.transform(df_test.values)
-    
-    scaler_y = StandardScaler()
-    scaler_y.fit(df_train['y'].values.reshape(-1, 1))
-    
-    # 3. 制作序列 (带边界拼接)
-    def prepare_dataset(curr_scaled, prev_scaled_tail=None):
-        if prev_scaled_tail is not None:
-            data_combined = np.vstack([prev_scaled_tail, curr_scaled])
-        else:
-            data_combined = curr_scaled
-        return create_sequences(data_combined, SEQ_LEN, PRED_LEN)
-
-    # 训练集
-    X_train, y_train = prepare_dataset(train_scaled, None)
-    
-    # 验证集 (拼接训练集末尾)
-    train_tail = train_scaled[-SEQ_LEN:]
-    X_val, y_val = prepare_dataset(val_scaled, train_tail)
-    
-    # 测试集 (拼接验证集末尾)
-    val_tail = val_scaled[-SEQ_LEN:]
-    X_test, y_test = prepare_dataset(test_scaled, val_tail)
-    
-    print(f"Sequences: Train={X_train.shape}, Val={X_val.shape}, Test={X_test.shape}")
-    
-    train_loader = DataLoader(TimeSeriesDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(X_val, y_val), batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(TimeSeriesDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
+    # 1. 统一无泄漏数据管道 (history 模式)
+    loaders, scaler_y, test_start_time, info, _ = get_data(
+        NWP_PATH, LOAD_PATH, SEQ_LEN, PRED_LEN, BATCH_SIZE,
+        TRAIN_RATIO, VAL_RATIO, POINTS_PER_DAY, mode="history")
+    train_loader = loaders['train']
+    val_loader = loaders['val']
+    test_loader = loaders['test']
     
     # 4. 模型训练 (Transformer)
-    input_dim = X_train.shape[2]
+    input_dim = info['n_features']
     model = TransformerModel(
         input_dim=input_dim, 
         output_dim=PRED_LEN,
@@ -325,9 +223,9 @@ def train_and_evaluate():
     test_preds = np.concatenate(test_preds_list)
     test_trues = np.concatenate(test_trues_list)
     
-    # 反归一化
-    test_preds_inv = scaler_y.inverse_transform(test_preds)
-    test_trues_inv = scaler_y.inverse_transform(test_trues)
+    # 反归一化 (scaler_y 提供标量 mean_/scale_)
+    test_preds_inv = test_preds * scaler_y.scale_ + scaler_y.mean_
+    test_trues_inv = test_trues * scaler_y.scale_ + scaler_y.mean_
     
     # 指标计算
     mae = mean_absolute_error(test_trues_inv.flatten(), test_preds_inv.flatten())
@@ -355,8 +253,7 @@ def train_and_evaluate():
     stitch_true = []
     stitch_time = []
     
-    # 测试集起始时间
-    test_start_time = df_test.index[0]
+    # 测试集起始时间 (由数据管道提供)
     
     # 按照 POINTS_PER_DAY 步长循环
     for i in range(0, len(test_preds_inv), POINTS_PER_DAY):
