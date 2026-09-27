@@ -12,6 +12,8 @@ import shutil
 
 import argparse
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 parser = argparse.ArgumentParser(description='Time Series Forecasting')
 
 
@@ -59,69 +61,7 @@ plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['axes.unicode_minus'] = False
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def load_and_process_data():
-    print("Loading data...")
-    # 读取数据
-    if not os.path.exists(NWP_PATH) or not os.path.exists(LOAD_PATH):
-        raise FileNotFoundError("数据文件路径不正确，请检查 NWP_PATH 和 LOAD_PATH")
-        
-    df_nwp = pd.read_csv(NWP_PATH)
-    df_load = pd.read_csv(LOAD_PATH)
-    
-    # 时间对齐
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    
-    # Inner Merge 确保只有两者都有的时间点
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    # 统一列名
-    load_col = [c for c in df.columns if 'load' in c.lower()]
-    if not load_col:
-        raise ValueError("未找到包含 'load' 的列名")
-    df = df.rename(columns={load_col[0]: 'y'})
-    
-    # 特征工程
-    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-    df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
-    
-    # 这里的 lag 特征如果要做，必须在 dropna 之前小心处理，
-    # 但为了保证整天切分逻辑简单，这里暂时去掉 shift 导致的大量缺失，
-    # 或者确保 dropna 后数据依然是连续完整的 15min 间隔。
-    # 简单起见，这里只 dropna 一次
-    df = df.dropna()
-    
-    # 确保列顺序，y 在最后
-    cols = [c for c in df.columns if c != 'y'] + ['y']
-    df = df[cols]
-    day_steps = 96
-    df = df.iloc[day_steps * 7:]
-    
-    return df
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-    def __len__(self): return len(self.X)
-    def __getitem__(self, idx): return self.X[idx], self.y[idx]
-
-def create_sequences(data, seq_len, pred_len):
-    """
-    制作滑窗序列
-    data: shape (N, Features)
-    return: X (N-seq-pred+1, seq, Feat-1), y (N-seq-pred+1, pred)
-    """
-    xs, ys = [], []
-    # 步长为1，尽可能多地采样训练
-    for i in range(len(data) - seq_len - pred_len + 1):
-        x = data[i:(i + seq_len), :-1] # 所有特征除了 y
-        y = data[(i + seq_len):(i + seq_len + pred_len), -1] # 只有 y
-        xs.append(x)
-        ys.append(y)
-    return np.array(xs), np.array(ys)
+# ================= 数据处理: 统一使用 data_provider.get_data (history 模式) =================
 
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
@@ -143,80 +83,16 @@ def train_and_evaluate():
     dayplot_dir = os.path.join(OUTPUT_DIR, "dayplot")
     os.makedirs(dayplot_dir, exist_ok=True)
     
-    # 1. 加载原始数据
-    df = load_and_process_data()
-    total_rows = len(df)
-    total_days = total_rows // POINTS_PER_DAY
-    
-    print(f"Total Data: {total_rows} points ({total_days:.2f} days)")
-    
-    # 2. 计算按天划分的索引
-    if FIXED_TRAIN_DAYS is not None and FIXED_VAL_DAYS is not None:
-        n_train_days = FIXED_TRAIN_DAYS
-        n_val_days = FIXED_VAL_DAYS
-    else:
-        n_train_days = int(total_days * TRAIN_RATIO)
-        n_val_days = int(total_days * VAL_RATIO)
-    
-    n_test_days = total_days - n_train_days - n_val_days
-    
-    if n_test_days <= 0:
-        raise ValueError("数据量不足以划分测试集，请调整比例或天数。")
-        
-    print(f"Split Plan (Days): Train={n_train_days}, Val={n_val_days}, Test={n_test_days}")
-    
-    # 计算切分点索引
-    train_end_idx = n_train_days * POINTS_PER_DAY
-    val_end_idx = (n_train_days + n_val_days) * POINTS_PER_DAY
-    
-    # 切分原始 DataFrame (为了保持时间索引后续画图用)
-    df_train = df.iloc[:train_end_idx]
-    df_val   = df.iloc[train_end_idx:val_end_idx]
-    df_test  = df.iloc[val_end_idx:]
-    
-    # 3. 归一化 (Fit 只在训练集上进行，防止泄露)
-    scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(df_train.values)
-    val_scaled = scaler.transform(df_val.values)
-    test_scaled = scaler.transform(df_test.values)
-    
-    scaler_y = StandardScaler()
-    # y是最后一列
-    scaler_y.fit(df_train['y'].values.reshape(-1, 1))
-    
-    # 4. 制作数据集序列
-    # 注意：验证集和测试集的第一个序列需要用到前一个数据集末尾的 SEQ_LEN 数据作为输入
-    # 否则第一个预测点的输入数据不够
-    
-    # 辅助函数：拼接前缀并生成序列
-    def prepare_dataset(curr_scaled, prev_scaled_tail=None):
-        if prev_scaled_tail is not None:
-            # 拼接到前面
-            data_combined = np.vstack([prev_scaled_tail, curr_scaled])
-        else:
-            data_combined = curr_scaled
-        return create_sequences(data_combined, SEQ_LEN, PRED_LEN)
+    # 1. 使用统一无泄漏数据管道 (history 模式: 只吃历史窗口, 但特征已含 NWP+日历+lag)
+    loaders, scaler_y, test_start_time, info, _ = get_data(
+        NWP_PATH, LOAD_PATH, SEQ_LEN, PRED_LEN, BATCH_SIZE,
+        TRAIN_RATIO, VAL_RATIO, POINTS_PER_DAY, mode="history")
+    train_loader = loaders['train']
+    val_loader = loaders['val']
+    test_loader = loaders['test']
 
-    # 训练集：直接制作
-    X_train, y_train = prepare_dataset(train_scaled, None)
-    
-    # 验证集：需要训练集最后 SEQ_LEN 个点
-    train_tail = train_scaled[-SEQ_LEN:]
-    X_val, y_val = prepare_dataset(val_scaled, train_tail)
-    
-    # 测试集：需要验证集最后 SEQ_LEN 个点
-    val_tail = val_scaled[-SEQ_LEN:]
-    X_test, y_test = prepare_dataset(test_scaled, val_tail)
-    
-    print(f"Sequences shape: Train={X_train.shape}, Val={X_val.shape}, Test={X_test.shape}")
-    
-    # 构造 DataLoader
-    train_loader = DataLoader(TimeSeriesDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(X_val, y_val), batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(TimeSeriesDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
-    
     # 5. 模型初始化与训练
-    input_dim = X_train.shape[2]
+    input_dim = info['n_features']
     model = LSTMModel(input_dim, HIDDEN_DIM, NUM_LAYERS, PRED_LEN).to(DEVICE)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -291,9 +167,9 @@ def train_and_evaluate():
     test_preds = np.concatenate(test_preds_list) # shape: (N_test, 96)
     test_trues = np.concatenate(test_trues_list)
     
-    # 反归一化
-    test_preds_inv = scaler_y.inverse_transform(test_preds)
-    test_trues_inv = scaler_y.inverse_transform(test_trues)
+    # 反归一化 (scaler_y 提供标量 mean_/scale_)
+    test_preds_inv = test_preds * scaler_y.scale_ + scaler_y.mean_
+    test_trues_inv = test_trues * scaler_y.scale_ + scaler_y.mean_
     
     # 计算全局指标
     mae = mean_absolute_error(test_trues_inv.flatten(), test_preds_inv.flatten())
@@ -325,7 +201,7 @@ def train_and_evaluate():
     # 我们每隔 96 (POINTS_PER_DAY) 取一个样本进行拼接
     # 这样刚好覆盖每一天，且互不重叠
     
-    test_start_time = df_test.index[0]
+    # test_start_time 由数据管道提供 (测试集首日起点)
     
     # 遍历每一天
     # 能够预测的天数 = len(test_preds) // 96 ?? 
