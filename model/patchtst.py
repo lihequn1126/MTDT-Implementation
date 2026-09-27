@@ -13,6 +13,8 @@ import math
 import random
 import argparse
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -58,6 +60,7 @@ class Config:
     TRAIN_RATIO = 0.7
     VAL_RATIO = 0.1
     ENC_IN = 0 # 动态设置
+    N_KNOWN = 0 # 未来已知协变量列数 (NWP + 日历, 动态设置)
 
 cfg = Config()
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,6 +83,7 @@ class Model(nn.Module):
         self.patch_len = configs.PATCH_LEN
         self.stride = configs.STRIDE
         self.pred_len = configs.PRED_LEN
+        self.n_known = configs.N_KNOWN
         self.full_seq_len = configs.SEQ_LEN + configs.PRED_LEN
         
         # 计算 Patch 数量
@@ -107,14 +111,14 @@ class Model(nn.Module):
         stdev = torch.sqrt(torch.var(x_hist, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         x_hist = (x_hist - means) / stdev
         
-        # 使用对应的通道均值对未来 NWP 进行归一化
-        means_nwp = means[:, :, :-1]
-        stdev_nwp = stdev[:, :, :-1]
+        # 使用对应的通道均值对未来已知协变量进行归一化 (前 n_known 列)
+        means_nwp = means[:, :, :self.n_known]
+        stdev_nwp = stdev[:, :, :self.n_known]
         x_fut_nwp = (x_fut_nwp - means_nwp) / stdev_nwp
         
-        # 2. 合并历史与未来已知信息
-        batch_size = x_hist.shape[0]
-        zeros_target = torch.zeros(batch_size, self.pred_len, 1, device=x_hist.device)
+        # 2. 合并历史与未来已知信息 (未知列 lag/rolling + 目标 置零)
+        batch_size, C = x_hist.shape[0], x_hist.shape[2]
+        zeros_target = torch.zeros(batch_size, self.pred_len, C - self.n_known, device=x_hist.device)
         x_fut_combined = torch.cat([x_fut_nwp, zeros_target], dim=2)
         x_full = torch.cat([x_hist, x_fut_combined], dim=1) # [B, L_full, C]
         
@@ -143,53 +147,7 @@ class Model(nn.Module):
         return final_out
 
 
-class TimeSeriesDataset(Dataset):
-    def __init__(self, data, seq_len, pred_len):
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-    def __len__(self):
-        return len(self.data) - self.seq_len - self.pred_len + 1
-    def __getitem__(self, index):
-        s_end = index + self.seq_len
-        r_end = s_end + self.pred_len
-        return self.data[index:s_end], self.data[s_end:r_end, :-1], self.data[s_end:r_end, -1:]
-
-def load_and_process_data():
-    if not os.path.exists(cfg.NWP_PATH) or not os.path.exists(cfg.LOAD_PATH):
-        return None
-    df_nwp = pd.read_csv(cfg.NWP_PATH)
-    df_load = pd.read_csv(cfg.LOAD_PATH)
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    target_col = [c for c in df.columns if 'load' in c.lower()][0]
-    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-    cols = [c for c in df.columns if c != target_col] + [target_col]
-    df = df[cols].ffill().bfill().iloc[96*7:]
-    return df
-
-def create_dataloaders(df):
-    total_days = len(df) // cfg.POINTS_PER_DAY
-    tr_idx = int(total_days * cfg.TRAIN_RATIO) * cfg.POINTS_PER_DAY
-    val_idx = int(total_days * (cfg.TRAIN_RATIO + cfg.VAL_RATIO)) * cfg.POINTS_PER_DAY
-    
-    scaler = StandardScaler()
-    train_vals = scaler.fit_transform(df.iloc[:tr_idx].values)
-    val_vals = scaler.transform(df.iloc[tr_idx-cfg.SEQ_LEN:val_idx].values)
-    test_vals = scaler.transform(df.iloc[val_idx-cfg.SEQ_LEN:].values)
-    
-    scaler_y = StandardScaler()
-    scaler_y.mean_, scaler_y.scale_ = scaler.mean_[-1], scaler.scale_[-1]
-    cfg.ENC_IN = train_vals.shape[1]
-
-    train_loader = DataLoader(TimeSeriesDataset(train_vals, cfg.SEQ_LEN, cfg.PRED_LEN), batch_size=cfg.BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(val_vals, cfg.SEQ_LEN, cfg.PRED_LEN), batch_size=cfg.BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(TimeSeriesDataset(test_vals, cfg.SEQ_LEN, cfg.PRED_LEN), batch_size=cfg.BATCH_SIZE, shuffle=False)
-    
-    return train_loader, val_loader, test_loader, scaler_y, df.index[val_idx]
+# ================= 数据处理: 统一使用 data_provider.get_data (future 模式) =================
 
 
 def train_and_evaluate():
@@ -197,9 +155,11 @@ def train_and_evaluate():
     dayplot_dir = os.path.join(cfg.OUTPUT_DIR, "dayplot")
     if not os.path.exists(dayplot_dir): os.makedirs(dayplot_dir)
     
-    df = load_and_process_data()
-    if df is None: return
-    train_loader, val_loader, test_loader, scaler_y, test_start_time = create_dataloaders(df)
+    loaders, scaler_y, test_start_time, info, _ = get_data(
+        cfg.NWP_PATH, cfg.LOAD_PATH, cfg.SEQ_LEN, cfg.PRED_LEN, cfg.BATCH_SIZE,
+        cfg.TRAIN_RATIO, cfg.VAL_RATIO, cfg.POINTS_PER_DAY, mode="future")
+    cfg.ENC_IN = info['n_features']; cfg.N_KNOWN = info['n_known']
+    train_loader, val_loader, test_loader = loaders['train'], loaders['val'], loaders['test']
     
     model = Model(cfg).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
