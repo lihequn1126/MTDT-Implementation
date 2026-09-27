@@ -13,6 +13,8 @@ import math
 
 import argparse
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 parser = argparse.ArgumentParser(description='Time Series Forecasting')
 
 
@@ -63,53 +65,7 @@ plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['axes.unicode_minus'] = False
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ================= 数据处理函数 =================
-def load_and_process_data():
-    print("Loading data...")
-    if not os.path.exists(NWP_PATH) or not os.path.exists(LOAD_PATH):
-        raise FileNotFoundError("数据文件路径不正确")
-        
-    df_nwp = pd.read_csv(NWP_PATH)
-    df_load = pd.read_csv(LOAD_PATH)
-    
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    load_col = [c for c in df.columns if 'load' in c.lower()]
-    if not load_col: raise ValueError("未找到 load 列")
-    df = df.rename(columns={load_col[0]: 'y'})
-    
-    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-    df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
-    
-    df = df.dropna()
-    cols = [c for c in df.columns if c != 'y'] + ['y']
-    df = df[cols]
-    
-    day_steps = 96
-    df = df.iloc[day_steps * 7:]
-    
-    return df
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-    def __len__(self): return len(self.X)
-    def __getitem__(self, idx): return self.X[idx], self.y[idx]
-
-def create_sequences(data, seq_len, pred_len):
-    xs, ys = [], []
-    for i in range(len(data) - seq_len - pred_len + 1):
-        x = data[i:(i + seq_len), :] # 输入包含 y
-        y = data[(i + seq_len):(i + seq_len + pred_len), -1] 
-        xs.append(x)
-        ys.append(y)
-    return np.array(xs), np.array(ys)
+# ================= 数据处理: 统一使用 data_provider.get_data (history 模式) =================
 
 # ================= Autoformer 组件 (含修复) =================
 
@@ -370,54 +326,16 @@ def train_and_evaluate():
     dayplot_dir = os.path.join(OUTPUT_DIR, "dayplot")
     os.makedirs(dayplot_dir, exist_ok=True)
     
-    # 加载
-    df = load_and_process_data()
-    total_rows = len(df)
-    total_days = total_rows // POINTS_PER_DAY
-    
-    if FIXED_TRAIN_DAYS is not None:
-        n_train_days = FIXED_TRAIN_DAYS
-        n_val_days = FIXED_VAL_DAYS
-    else:
-        n_train_days = int(total_days * TRAIN_RATIO)
-        n_val_days = int(total_days * VAL_RATIO)
-    
-    train_end_idx = n_train_days * POINTS_PER_DAY
-    val_end_idx = (n_train_days + n_val_days) * POINTS_PER_DAY
-    
-    df_train = df.iloc[:train_end_idx]
-    df_val   = df.iloc[train_end_idx:val_end_idx]
-    df_test  = df.iloc[val_end_idx:]
-    
-    # 归一化
-    scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(df_train.values)
-    val_scaled = scaler.transform(df_val.values)
-    test_scaled = scaler.transform(df_test.values)
-    
-    scaler_y = StandardScaler()
-    scaler_y.fit(df_train['y'].values.reshape(-1, 1))
-    
-    # 数据集
-    def prepare_dataset(curr_scaled, prev_scaled_tail=None):
-        if prev_scaled_tail is not None:
-            data_combined = np.vstack([prev_scaled_tail, curr_scaled])
-        else:
-            data_combined = curr_scaled
-        return create_sequences(data_combined, SEQ_LEN, PRED_LEN)
-
-    X_train, y_train = prepare_dataset(train_scaled, None)
-    train_tail = train_scaled[-SEQ_LEN:]
-    X_val, y_val = prepare_dataset(val_scaled, train_tail)
-    val_tail = val_scaled[-SEQ_LEN:]
-    X_test, y_test = prepare_dataset(test_scaled, val_tail)
-    
-    train_loader = DataLoader(TimeSeriesDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(X_val, y_val), batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(TimeSeriesDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
+    # 统一无泄漏数据管道 (history 模式)
+    loaders, scaler_y, test_start_time, info, _ = get_data(
+        NWP_PATH, LOAD_PATH, SEQ_LEN, PRED_LEN, BATCH_SIZE,
+        TRAIN_RATIO, VAL_RATIO, POINTS_PER_DAY, mode="history")
+    train_loader = loaders['train']
+    val_loader = loaders['val']
+    test_loader = loaders['test']
     
     # 模型 (Lite)
-    input_dim = X_train.shape[2] 
+    input_dim = info['n_features']
     model = Autoformer(
         enc_in=input_dim, 
         dec_in=input_dim, 
@@ -507,8 +425,8 @@ def train_and_evaluate():
     preds = np.concatenate(preds)
     trues = np.concatenate(trues)
     
-    preds_inv = scaler_y.inverse_transform(preds)
-    trues_inv = scaler_y.inverse_transform(trues)
+    preds_inv = preds * scaler_y.scale_ + scaler_y.mean_
+    trues_inv = trues * scaler_y.scale_ + scaler_y.mean_
     
     mae = mean_absolute_error(trues_inv.flatten(), preds_inv.flatten())
     rmse = np.sqrt(mean_squared_error(trues_inv.flatten(), preds_inv.flatten()))
@@ -520,7 +438,7 @@ def train_and_evaluate():
         f.write(f"MAE: {mae}\nRMSE: {rmse}\nR2: {r2}\n")
         
     stitch_pred, stitch_true, stitch_time = [], [], []
-    test_start_time = df_test.index[0]
+    # test_start_time 由统一数据管道提供
     
     for i in range(0, len(preds_inv), POINTS_PER_DAY):
         if i >= len(preds_inv): break
