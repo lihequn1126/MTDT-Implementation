@@ -13,6 +13,8 @@ import math
 import shutil
 import random
 
+from data_provider import get_data  # 统一无泄漏数据管道
+
 # ================= 0. 设置随机种子 =================
 def set_seed(seed=42):
     random.seed(seed)
@@ -58,6 +60,7 @@ class Config:
 
     # iTransformer 模型参数
     ENC_IN = 0          # 输入特征数 (自动计算)
+    N_KNOWN = 0         # 未来已知协变量列数 (NWP + 日历, 自动计算)
     D_MODEL = 512       # Embedding 维度
     N_HEADS = 8         # 多头注意力头数
     E_LAYERS = 2        # Encoder 层数
@@ -203,6 +206,7 @@ class Model(nn.Module):
         self.pred_len = configs.PRED_LEN
         self.output_attention = False 
         self.use_norm = configs.USE_NORM
+        self.n_known = configs.N_KNOWN
         
         # 核心修改：Embedding 接受的历史长度为 Seq + Pred
         # 我们将把 [历史数据, 未来NWP(Target补0)] 拼在一起输入
@@ -242,17 +246,17 @@ class Model(nn.Module):
             x_hist = (x_hist - means) / stdev
             
             # 归一化未来NWP数据 (使用历史的统计量，防止泄露)
-            # x_fut_nwp 只有 N-1 列，对应 x_hist 的前 N-1 列 (假设Target在最后)
-            means_nwp = means[:, :, :-1]
-            stdev_nwp = stdev[:, :, :-1]
+            # 仅前 n_known 列 (NWP + 日历) 是未来已知量
+            means_nwp = means[:, :, :self.n_known]
+            stdev_nwp = stdev[:, :, :self.n_known]
             x_fut_nwp = (x_fut_nwp - means_nwp) / stdev_nwp
 
         # 2. 构造全长序列输入
         # 目标：构建 [B, Seq + Pred, N]
         
-        # 2.1 构造未来的 Load 部分 (用 0 填充，因为我们不知道未来 Load)
-        batch_size = x_hist.shape[0]
-        zeros_target = torch.zeros(batch_size, self.pred_len, 1, device=x_hist.device)
+        # 2.1 构造未来的未知部分 (lag/rolling + Load 用 0 填充; 未来不可知)
+        batch_size, C = x_hist.shape[0], x_hist.shape[2]
+        zeros_target = torch.zeros(batch_size, self.pred_len, C - self.n_known, device=x_hist.device)
         
         # 2.2 拼接未来部分 [B, Pred, N]
         x_fut_combined = torch.cat([x_fut_nwp, zeros_target], dim=2)
@@ -293,153 +297,7 @@ class Model(nn.Module):
 
         return dec_out
 
-# ================= 2. 数据处理 =================
-
-def load_and_process_data():
-    print("🚀 Loading data...")
-    if not os.path.exists(cfg.NWP_PATH) or not os.path.exists(cfg.LOAD_PATH):
-        print("Warning: Data path not found.")
-        return None
-
-    try:
-        df_nwp = pd.read_csv(cfg.NWP_PATH)
-        df_load = pd.read_csv(cfg.LOAD_PATH)
-    except Exception as e:
-        print(f"Error reading CSV: {e}")
-        return None
-    
-    df_nwp['time'] = pd.to_datetime(df_nwp['time'])
-    df_load['time'] = pd.to_datetime(df_load['time'])
-    
-    # Merge
-    df = pd.merge(df_load, df_nwp, on='time', how='inner').sort_values('time').set_index('time')
-    
-    # 统一 Load 列名并确保在最后
-    load_cols = [c for c in df.columns if 'load' in c.lower()]
-    if not load_cols: 
-        target_col = df.columns[-1]
-    else:
-        target_col = load_cols[0]
-        
-    # 特征工程 (可选)
-    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-    
-    # 重新排列: [特征..., Load]
-    feature_cols = [c for c in df.columns if c != target_col]
-    df = df[feature_cols + [target_col]]
-    
-    # 填充缺失值
-    df = df.ffill().bfill()
-    day_steps = 96
-    df = df.iloc[day_steps * 7:]
-    
-    print(f"Features: {feature_cols}")
-    print(f"Target: {target_col}")
-    
-    return df
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, data, seq_len, pred_len):
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        
-    def __len__(self):
-        return len(self.data) - self.seq_len - self.pred_len + 1
-        
-    def __getitem__(self, index):
-        s_begin = index
-        s_end = s_begin + self.seq_len
-        r_begin = s_end
-        r_end = r_begin + self.pred_len
-        
-        # 1. 历史序列 [Seq, N]
-        seq_x = self.data[s_begin:s_end]
-        
-        # 2. 未来天气序列 [Pred, N-1] (假设最后一列是Target)
-        # 注意：这里我们取未来的 NWP 特征
-        seq_x_fut_nwp = self.data[r_begin:r_end, :-1]
-        
-        # 3. 未来标签 [Pred, 1] (只取最后一列)
-        seq_y = self.data[r_begin:r_end, -1:]
-        
-        return seq_x, seq_x_fut_nwp, seq_y
-
-def create_dataloaders(df):
-    total_rows = len(df)
-    total_days = total_rows // cfg.POINTS_PER_DAY
-    print(f"Total Data: {total_rows} points ({total_days:.2f} days)")
-
-    # 1. 计算按天切分索引
-    if cfg.FIXED_TRAIN_DAYS is not None and cfg.FIXED_VAL_DAYS is not None:
-        n_train_days = cfg.FIXED_TRAIN_DAYS
-        n_val_days = cfg.FIXED_VAL_DAYS
-    else:
-        n_train_days = int(total_days * cfg.TRAIN_RATIO)
-        n_val_days = int(total_days * cfg.VAL_RATIO)
-    
-    n_test_days = total_days - n_train_days - n_val_days
-    if n_test_days <= 0: n_test_days = 0 
-    
-    print(f"Split Plan (Days): Train={n_train_days}, Val={n_val_days}, Test={n_test_days}")
-
-    train_end_idx = n_train_days * cfg.POINTS_PER_DAY
-    val_end_idx = (n_train_days + n_val_days) * cfg.POINTS_PER_DAY
-    
-    df_train = df.iloc[:train_end_idx]
-    df_val = df.iloc[train_end_idx:val_end_idx]
-    df_test = df.iloc[val_end_idx:] 
-    
-    # 2. 归一化 (仅在 Train Fit)
-    scaler = StandardScaler()
-    train_vals = scaler.fit_transform(df_train.values)
-    
-    if len(df_val) > 0: val_vals = scaler.transform(df_val.values)
-    else: val_vals = np.empty((0, train_vals.shape[1]))
-
-    if len(df_test) > 0: test_vals = scaler.transform(df_test.values)
-    else: test_vals = np.empty((0, train_vals.shape[1]))
-    
-    # 记录 y 的 scaler 用于反归一化 (最后一列)
-    scaler_y = StandardScaler()
-    scaler_y.mean_ = scaler.mean_[-1]
-    scaler_y.scale_ = scaler.scale_[-1]
-    scaler_y.var_ = scaler.var_[-1]
-    
-    # 设置 Config 中的通道数
-    cfg.ENC_IN = train_vals.shape[1]
-    
-    # 3. 数据集构造 (含 Lookback 处理)
-    def prepare_data(curr, prev_tail=None):
-        if prev_tail is not None:
-            combined = np.vstack([prev_tail, curr])
-        else:
-            combined = curr
-        return combined
-
-    train_data = prepare_data(train_vals, None)
-    
-    train_tail = train_vals[-cfg.SEQ_LEN:] if len(train_vals) > 0 else None
-    val_data = prepare_data(val_vals, train_tail) if len(val_vals) > 0 else np.empty((0, cfg.ENC_IN))
-    
-    val_tail = val_vals[-cfg.SEQ_LEN:] if len(val_vals) > 0 else None
-    test_data = prepare_data(test_vals, val_tail) if len(test_vals) > 0 else np.empty((0, cfg.ENC_IN))
-    
-    train_set = TimeSeriesDataset(train_data, cfg.SEQ_LEN, cfg.PRED_LEN)
-    val_set = TimeSeriesDataset(val_data, cfg.SEQ_LEN, cfg.PRED_LEN) if len(val_data) > 0 else []
-    test_set = TimeSeriesDataset(test_data, cfg.SEQ_LEN, cfg.PRED_LEN) if len(test_data) > 0 else []
-    
-    print(f"Samples: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
-
-    train_loader = DataLoader(train_set, batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    
-    # 记录测试集开始时间
-    test_start_time = df_test.index[0] if len(df_test) > 0 else None
-    
-    return train_loader, val_loader, test_loader, scaler_y, test_start_time
+# ================= 2. 数据处理: 统一使用 data_provider.get_data (future 模式) =================
 
 # ================= 3. 训练流程 =================
 
@@ -453,9 +311,11 @@ def train_and_evaluate():
     os.makedirs(dayplot_dir, exist_ok=True)
     
     # 1. 数据
-    df = load_and_process_data()
-    if df is None: return
-    train_loader, val_loader, test_loader, scaler_y, test_start_time = create_dataloaders(df)
+    loaders, scaler_y, test_start_time, info, _ = get_data(
+        cfg.NWP_PATH, cfg.LOAD_PATH, cfg.SEQ_LEN, cfg.PRED_LEN, cfg.BATCH_SIZE,
+        cfg.TRAIN_RATIO, cfg.VAL_RATIO, cfg.POINTS_PER_DAY, mode="future")
+    cfg.ENC_IN = info['n_features']; cfg.N_KNOWN = info['n_known']
+    train_loader, val_loader, test_loader = loaders['train'], loaders['val'], loaders['test']
     
     # 2. 模型
     model = Model(cfg).to(DEVICE)
